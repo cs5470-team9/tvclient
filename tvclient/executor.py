@@ -1,12 +1,14 @@
 """Per-rollout tool call executor backed by the TVCache."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
 from typing import List, Optional, Tuple, Type
 
 from tvclient.client import FindResult, TVCacheClient
+from tvclient.protocol import CLAIM_OWNER, CLAIM_PENDING, CLAIM_READY
 from tvclient.sandbox import Sandbox
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator
 from tvclient.snapshot_policy import (
@@ -17,6 +19,9 @@ from tvclient.snapshot_policy import (
 from tvclient.tool_call import TestToolCall, ToolCall
 
 MAX_RUNTIME_MS = 2**32
+# Length of one Inspect long poll while waiting on another rollout's execution;
+# must stay below the client's request timeout.
+INSPECT_WAIT_MS = 2000
 
 
 class TvcacheToolExecutor:
@@ -26,6 +31,10 @@ class TvcacheToolExecutor:
     sandbox. The live sandbox is never discarded on a cache hit: it simply
     falls behind the rollout's history, and on a later miss it is either
     fast-forwarded or replaced by a fork of a deeper cached sandbox.
+
+    With coalesce=True, concurrent rollouts that reach the same uncached call
+    execute it once: the first claims it (a pending node) and the others wait
+    for its result, which they then treat exactly like a cache hit.
     """
 
     def __init__(
@@ -40,8 +49,16 @@ class TvcacheToolExecutor:
         snapshot_cost_multiplier: float = SNAPSHOT_COST_MULTIPLIER,
         initial_fork_cost_seconds: float = INITIAL_FORK_COST_SECONDS,
         ttl: Optional[int] = None,
+        coalesce: bool = False,
+        max_wait_seconds: float = 1800.0,
     ):
         self.client = TVCacheClient(host, port)
+        if coalesce and INSPECT_WAIT_MS / 1000 >= self.client.timeout:
+            raise ValueError("INSPECT_WAIT_MS must be below the client request timeout")
+        self.coalesce = coalesce
+        # A waiter gives up and executes the call itself after this long, so a
+        # hung owner can delay other rollouts but never strand them.
+        self.max_wait_seconds = max_wait_seconds
         self.tool_call_env_class = tool_call_env_class
         self.tool_call_class = tool_call_class
         self.task_name = task_id
@@ -63,6 +80,8 @@ class TvcacheToolExecutor:
         self.sandbox_history: List[str] = []
         self.total_calls = 0
         self.total_executions = 0
+        self.total_waits = 0  # calls served by waiting on another rollout
+        self.total_owned = 0  # claims this rollout executed for others too
         self.logger = logging.getLogger(__name__)
         self.fork_generator: Optional[AbstractForkGenerator] = None
         self._pending_stops: List[asyncio.Task] = []
@@ -108,8 +127,16 @@ class TvcacheToolExecutor:
         self.total_calls += 1
         history, current = tool_commands[:-1], tool_commands[-1]
         stateful_calls = [c for c in history if c.will_mutate_state()]
-        path = [c.serialize() for c in stateful_calls] + [current.serialize()]
+        prefix = [c.serialize() for c in stateful_calls]
+        path = prefix + [current.serialize()]
 
+        if self.coalesce:
+            return await self._claim_or_execute(prefix, path, stateful_calls, current)
+        return await self._find_or_execute(path, stateful_calls, current)
+
+    async def _find_or_execute(
+        self, path: List[str], stateful_calls: List[ToolCall], current: ToolCall
+    ) -> str:
         cst = time.perf_counter()
         found = await self.client.find(self.task_name, path)
         cet = time.perf_counter()
@@ -132,6 +159,99 @@ class TvcacheToolExecutor:
 
         suffix_calls = stateful_calls[resume_depth:] + [current]
         return await self._execute_and_insert(environment, path, suffix_calls, resume_depth)
+
+    async def _claim_or_execute(
+        self,
+        prefix: List[str],
+        path: List[str],
+        stateful_calls: List[ToolCall],
+        current: ToolCall,
+    ) -> str:
+        """Coalescing lookup: a ready result is a hit, a call another rollout is
+        executing is awaited, and otherwise this rollout executes it (as the
+        claim's owner, or uncoalesced when the prefix is not cached)."""
+        async with await self.client.claim(self.task_name, prefix, [path[-1]]) as claimed:
+            outcome = claimed.outcomes[0]
+
+            if outcome.status == CLAIM_READY:
+                self.logger.debug(
+                    f"CACHE HIT for task id {self.task_name} at depth {len(path)} "
+                    f"for rollout {self.rollout_id}"
+                )
+                return outcome.value
+
+            if outcome.status != CLAIM_PENDING:
+                generation = outcome.generation if outcome.status == CLAIM_OWNER else None
+                if generation is not None:
+                    self.total_owned += 1
+                self.logger.debug(
+                    f"CACHE {'OWNER' if generation is not None else 'MISS'} for task id "
+                    f"{self.task_name} at depth {len(path)} for rollout {self.rollout_id}"
+                )
+                try:
+                    # Under the lease, as in _find_or_execute.
+                    environment, resume_depth = await self._acquire_environment(claimed, path)
+                except BaseException:
+                    await self._fail_claim(path, generation)
+                    raise
+
+        if outcome.status == CLAIM_PENDING:
+            return await self._wait_or_execute(prefix, path, stateful_calls, current)
+
+        suffix_calls = stateful_calls[resume_depth:] + [current]
+        try:
+            return await self._execute_and_insert(
+                environment, path, suffix_calls, resume_depth, generation
+            )
+        except BaseException:
+            await self._fail_claim(path, generation)
+            raise
+
+    async def _wait_or_execute(
+        self,
+        prefix: List[str],
+        path: List[str],
+        stateful_calls: List[ToolCall],
+        current: ToolCall,
+    ) -> str:
+        """Waits for the rollout executing this call. Its result is used like a
+        hit: the live sandbox falls behind and is caught up on a later miss."""
+        self.total_waits += 1
+        self.logger.debug(
+            f"CACHE WAIT for task id {self.task_name} at depth {len(path)} "
+            f"for rollout {self.rollout_id}"
+        )
+        value = (await self._wait_for_owners(prefix, [path[-1]]))[0]
+        if value is not None:
+            return value
+
+        # The owner failed, disconnected, or exceeded max_wait_seconds.
+        self.logger.debug(
+            f"[WAIT]: No result from owner at depth {len(path)}; executing without "
+            f"coalescing for rollout {self.rollout_id}"
+        )
+        return await self._find_or_execute(path, stateful_calls, current)
+
+    async def _wait_for_owners(self, prefix: List[str], entries: List[str]) -> List[Optional[str]]:
+        """Each entry's published value, or None if its owner failed or the
+        wait exceeded max_wait_seconds."""
+        deadline = time.monotonic() + self.max_wait_seconds
+        while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            response = await self.client.inspect(
+                self.task_name, prefix, entries, wait_ms=max(0, min(INSPECT_WAIT_MS, remaining_ms))
+            )
+            if remaining_ms <= 0 or all(o.status != CLAIM_PENDING for o in response.outcomes):
+                return [o.value if o.status == CLAIM_READY else None for o in response.outcomes]
+
+    async def _fail_claim(self, path: List[str], generation: Optional[int]) -> None:
+        """Releases this rollout's claim so its waiters execute the call
+        themselves. Safe after a publish: the server rejects it then. Best
+        effort: if the connection is gone, the server already failed the claim."""
+        if generation is None:
+            return
+        with contextlib.suppress(Exception):
+            await self.client.publish(self.task_name, path, generation, None, None, runtime=0)
 
     async def test(self, tool_call_history: List[ToolCall]) -> str:
         """Returns the (possibly cached) test result for the rollout's history.
@@ -235,8 +355,13 @@ class TvcacheToolExecutor:
         path: List[str],
         suffix_calls: List[ToolCall],
         resume_depth: int,
+        generation: Optional[int] = None,
     ) -> str:
-        """Executes the unmatched suffix in the environment and populates the cache."""
+        """Executes the unmatched suffix in the environment and populates the cache.
+
+        With a generation, this rollout owns the claim on the last call (the
+        current one) and publishes it; the replayed calls before it are already
+        cached and are inserted as usual."""
         last_value = None
         fork_cost_ms = await self.snapshot_policy.prime()
         if fork_cost_ms is not None:
@@ -276,17 +401,20 @@ class TvcacheToolExecutor:
             if tool_call.will_mutate_state():
                 self.sandbox_history.append(tool_call.serialize())
 
+            claimed = generation if depth == len(path) else None
+
             if value.startswith("Failed to execute"):
                 # Environment-reported failure: keep the rollout going but never cache it.
                 self.logger.debug(
                     f"[TOOL EXEC]: Not caching failed result at depth {depth} "
                     f"for rollout {self.rollout_id}"
                 )
+                await self._fail_claim(path, claimed)
                 last_value = value
                 continue
             
             await self._update_tvcache_with_execution(
-                tool_call, environment, path, depth, value, runtime_seconds
+                tool_call, environment, path, depth, value, runtime_seconds, claimed
             )
             last_value = value
 
@@ -300,6 +428,7 @@ class TvcacheToolExecutor:
         depth: int,
         value: str,
         runtime_seconds: float,
+        generation: Optional[int] = None,
     ) -> None:
 
         sandbox_id = None
@@ -322,14 +451,32 @@ class TvcacheToolExecutor:
             self.snapshot_policy.reset()
 
         ist = time.perf_counter()
-        insert_result = await self.client.insert(
-            self.task_name,
-            list(path[:depth]),
-            value,
-            sandbox_id,
-            runtime=self._runtime_ms(runtime_seconds),
-            ttl=self.ttl,
-        )
+        if generation is None:
+            insert_result = await self.client.insert(
+                self.task_name,
+                list(path[:depth]),
+                value,
+                sandbox_id,
+                runtime=self._runtime_ms(runtime_seconds),
+                ttl=self.ttl,
+            )
+        else:
+            # Completing our claim wakes every rollout waiting on this call.
+            insert_result = await self.client.publish(
+                self.task_name,
+                list(path[:depth]),
+                generation,
+                value,
+                sandbox_id,
+                runtime=self._runtime_ms(runtime_seconds),
+                ttl=self.ttl,
+            )
+            if not insert_result.value_inserted:
+                # Our claim was failed meanwhile (e.g. the connection dropped);
+                # the rollout still returns its own result.
+                self.logger.debug(
+                    f"Publish rejected at depth {depth} for rollout {self.rollout_id}"
+                )
         iet = time.perf_counter()
         self.logger.debug(
             f"Inserted value at depth {depth} in {iet - ist} seconds "

@@ -2,7 +2,8 @@
 
 Each rollout owns one TVCacheClient (and therefore one connection); requests
 on a connection are sequential, and concurrency comes from many rollouts each
-holding their own client.
+holding their own client. Coroutines may share a client: a lock serializes
+their requests on the connection.
 """
 
 import asyncio
@@ -13,6 +14,8 @@ from typing import List, Optional
 
 from tvclient import protocol
 from tvclient.protocol import (
+    ClaimOutcome,
+    ClaimResponse,
     FindResponse,
     ForkCost,
     InsertResult,
@@ -65,6 +68,23 @@ class FindResult:
         await self.release()
 
 
+class ClaimResult(FindResult):
+    """A claim response plus the lease on the prefix sandbox, if one was returned.
+
+    The server leases a sandbox only when some entry must be executed (owner
+    or missing), so release it exactly like a FindResult:
+
+        async with await client.claim(task_id, prefix, entries) as claimed:
+            ...  # claimed.outcomes[i] is the outcome for entries[i]
+    """
+
+    def __init__(self, client: "TVCacheClient", task_id: str, response: ClaimResponse):
+        super().__init__(
+            client, task_id, FindResponse(None, response.sandbox_path, response.sandbox_id)
+        )
+        self.outcomes: List[ClaimOutcome] = response.outcomes
+
+
 class TVCacheClient:
     """Typed async client for all TVCache server operations."""
 
@@ -83,6 +103,9 @@ class TVCacheClient:
         self.retry_backoff = retry_backoff
         self.reader: Optional[asyncio.StreamReader] = None
         self.writer: Optional[asyncio.StreamWriter] = None
+        # One request/response at a time per connection; responses carry no
+        # request id, so interleaving would hand a response to the wrong caller.
+        self._lock = asyncio.Lock()
         self.logger = logging.getLogger(__name__)
 
     async def __aenter__(self) -> "TVCacheClient":
@@ -128,19 +151,20 @@ class TVCacheClient:
         failed request itself is not retried (a retried find would double-count
         a sandbox reference).
         """
-        if self.reader is None or self.writer is None:
-            await self.connect()
+        async with self._lock:
+            if self.reader is None or self.writer is None:
+                await self.connect()
 
-        try:
-            self.writer.write(request)
-            await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
-            return await asyncio.wait_for(
-                protocol.decode_response(self.reader),
-                timeout=self.timeout,
-            )
-        except (OSError, EOFError, asyncio.IncompleteReadError, asyncio.TimeoutError):
-            await self.close()
-            raise
+            try:
+                self.writer.write(request)
+                await asyncio.wait_for(self.writer.drain(), timeout=self.timeout)
+                return await asyncio.wait_for(
+                    protocol.decode_response(self.reader),
+                    timeout=self.timeout,
+                )
+            except (OSError, EOFError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+                await self.close()
+                raise
 
     async def insert(
         self,
@@ -169,6 +193,42 @@ class TVCacheClient:
         reference count and the caller owns the matching unref_sandbox call."""
         response = await self._send_request(protocol.encode_find(task_id, path))
         return self._expect(response, FindResponse)
+
+    async def claim(self, task_id: str, prefix: List[str], entries: List[str]) -> ClaimResult:
+        """Atomically resolves each entry under prefix as ready, pending (someone
+        else is executing it), owner (this connection must execute and publish
+        it), or missing (prefix absent). Entries must be distinct."""
+        response = await self._send_request(protocol.encode_claim(task_id, prefix, entries))
+        return ClaimResult(self, task_id, self._expect(response, ClaimResponse))
+
+    async def inspect(
+        self, task_id: str, prefix: List[str], entries: List[str], wait_ms: int = 0
+    ) -> ClaimResponse:
+        """Read-only status of each entry. With wait_ms > 0 the server holds the
+        request until no entry is pending or wait_ms elapses (keep it below
+        timeout). Never claims, creates nodes, or counts hits."""
+        response = await self._send_request(
+            protocol.encode_inspect(task_id, prefix, entries, wait_ms)
+        )
+        return self._expect(response, ClaimResponse)
+
+    async def publish(
+        self,
+        task_id: str,
+        path: List[str],
+        generation: int,
+        value: Optional[str],
+        sandbox_id: Optional[str],
+        runtime: int,
+        ttl: Optional[int] = None,
+    ) -> InsertResult:
+        """Completes a claim this connection owns; value None marks it failed.
+        Rejected (value_inserted False) if the claim is no longer this
+        connection's current one."""
+        response = await self._send_request(
+            protocol.encode_publish(task_id, path, generation, value, sandbox_id, runtime, ttl)
+        )
+        return self._expect(response, InsertResult)
 
     async def unref_sandbox(self, task_id: str, sandbox_id: str) -> int:
         response = await self._send_request(

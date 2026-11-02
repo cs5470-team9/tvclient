@@ -1,6 +1,6 @@
 """Binary wire protocol for the TVCache server.
 
-Request op bytes 1-8 and response type bytes 1-8, big-endian, with
+Request op bytes 1-13 and response type bytes 1-10, big-endian, with
 bool-prefixed optional fields. This module only knows how to encode request
 payloads and decode responses from an asyncio.StreamReader; connection
 handling lives in TVCacheClient.
@@ -22,6 +22,9 @@ DRAIN_RECLAIMABLE_SANDBOXES_REQUEST = 7
 LIST_HOT_SANDBOXES_REQUEST = 8
 REPORT_FORK_COST_REQUEST = 9
 GET_FORK_COST_REQUEST = 10
+CLAIM_REQUEST = 11
+INSPECT_REQUEST = 12
+PUBLISH_REQUEST = 13
 
 INSERT_RESULT_RESPONSE = 1
 FIND_RESULT_RESPONSE = 2
@@ -32,6 +35,14 @@ MARK_SANDBOXES_EVICTED_RESULT_RESPONSE = 6
 SANDBOX_CANDIDATES_RESPONSE = 7
 RECLAIMABLE_SANDBOXES_RESPONSE = 8
 FORK_COST_RESPONSE = 9
+CLAIM_RESULTS_RESPONSE = 10
+
+# Per-entry status of a claim or inspect.
+CLAIM_MISSING = 0  # prefix absent, or the node has no result yet
+CLAIM_OWNER = 1  # this connection must execute the call and publish it
+CLAIM_PENDING = 2  # another connection is executing it
+CLAIM_READY = 3  # cached result available
+CLAIM_FAILED = 4  # the owner's execution failed or its connection closed
 
 
 class TVCacheServerError(Exception):
@@ -102,6 +113,23 @@ class JsonResponse:
     json: str
 
 
+@dataclass(frozen=True)
+class ClaimOutcome:
+    status: int
+    node_id: int
+    generation: int
+    value: Optional[str]  # only for CLAIM_READY
+
+
+@dataclass(frozen=True)
+class ClaimResponse:
+    """One outcome per requested entry, plus the prefix sandbox lease (claim only)."""
+
+    sandbox_path: Optional[List[str]]
+    sandbox_id: Optional[str]
+    outcomes: List[ClaimOutcome]
+
+
 def write_u8(value: int) -> bytes:
     return struct.pack(">B", value)
 
@@ -146,7 +174,14 @@ def encode_insert(
     encoded = write_u8(INSERT_REQUEST)
     encoded += write_string_u16(task_id)
     encoded += write_path(path)
-    encoded += write_u32(runtime)  # milliseconds
+    return encoded + _encode_insert_fields(value, sandbox_id, runtime, ttl)
+
+
+def _encode_insert_fields(
+    value: Optional[str], sandbox_id: Optional[str], runtime: int, ttl: Optional[int]
+) -> bytes:
+    """The fields Insert and Publish share, after the path (and generation)."""
+    encoded = write_u32(runtime)  # milliseconds
 
     encoded += write_bool(value is not None)
     if value is not None:
@@ -161,6 +196,44 @@ def encode_insert(
         encoded += write_u32(ttl)
 
     return encoded
+
+
+def encode_publish(
+    task_id: str,
+    path: List[str],
+    generation: int,
+    value: Optional[str],
+    sandbox_id: Optional[str],
+    runtime: int,
+    ttl: Optional[int] = None,
+) -> bytes:
+    """An insert carrying the claim's generation; value None reports failure."""
+    return (
+        write_u8(PUBLISH_REQUEST)
+        + write_string_u16(task_id)
+        + write_path(path)
+        + write_u32(generation)
+        + _encode_insert_fields(value, sandbox_id, runtime, ttl)
+    )
+
+
+def encode_claim(task_id: str, prefix: List[str], entries: List[str]) -> bytes:
+    return (
+        write_u8(CLAIM_REQUEST)
+        + write_string_u16(task_id)
+        + write_path(prefix)
+        + write_path(entries)
+    )
+
+
+def encode_inspect(task_id: str, prefix: List[str], entries: List[str], wait_ms: int) -> bytes:
+    return (
+        write_u8(INSPECT_REQUEST)
+        + write_string_u16(task_id)
+        + write_path(prefix)
+        + write_path(entries)
+        + write_u32(wait_ms)
+    )
 
 
 def encode_find(task_id: str, path: List[str]) -> bytes:
@@ -326,5 +399,23 @@ async def decode_response(reader: asyncio.StreamReader) -> object:
 
     if response_type == FORK_COST_RESPONSE:
         return ForkCost(fork_cost_ms=await read_u32(reader))
+
+    if response_type == CLAIM_RESULTS_RESPONSE:
+        sandbox_path = await read_optional_path(reader)
+        sandbox_id = await read_optional_string_u16(reader)
+        count = await read_u16(reader)
+        return ClaimResponse(
+            sandbox_path=sandbox_path,
+            sandbox_id=sandbox_id,
+            outcomes=[
+                ClaimOutcome(
+                    status=await read_u8(reader),
+                    node_id=await read_u64(reader),
+                    generation=await read_u32(reader),
+                    value=await read_optional_string_u32(reader),
+                )
+                for _ in range(count)
+            ],
+        )
 
     raise ValueError(f"unknown response type: {response_type}")
