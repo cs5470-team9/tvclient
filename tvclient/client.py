@@ -135,14 +135,17 @@ class TVCacheClient:
         raise last_error
 
     async def close(self) -> None:
-        if self.writer is not None:
-            self.writer.close()
+        # Detach synchronously. Cancellation during wait_closed must not leave
+        # a partially consumed response available to the next request.
+        writer = self.writer
+        self.reader = None
+        self.writer = None
+        if writer is not None:
+            writer.close()
             try:
-                await self.writer.wait_closed()
+                await writer.wait_closed()
             except (OSError, asyncio.TimeoutError):
                 pass
-            self.reader = None
-            self.writer = None
 
     async def _send_request(self, request: bytes) -> object:
         """Sends one request and decodes one response.
@@ -150,6 +153,12 @@ class TVCacheClient:
         A broken connection is discarded so the next request dials fresh; the
         failed request itself is not retried (a retried find would double-count
         a sandbox reference).
+
+        Cancellation after a write also discards the connection: responses have
+        no request IDs, so a late or partial response cannot safely be reused.
+        The cancelled request is never replayed. Disconnecting an owner also
+        fails its outstanding claims under the server's existing policy; this
+        is not an exactly-once side-effect or unknown-lease recovery guarantee.
         """
         async with self._lock:
             if self.reader is None or self.writer is None:
@@ -162,7 +171,8 @@ class TVCacheClient:
                     protocol.decode_response(self.reader),
                     timeout=self.timeout,
                 )
-            except (OSError, EOFError, asyncio.IncompleteReadError, asyncio.TimeoutError):
+            except (OSError, EOFError, asyncio.IncompleteReadError,
+                    asyncio.TimeoutError, asyncio.CancelledError):
                 await self.close()
                 raise
 
